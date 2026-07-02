@@ -1,0 +1,444 @@
+'''
+Mask imputation (default out_dim=1; forward uses the last time step).
+GraphWaveNet.py
+Input  input: [B, C_in, N] or [B, C_in, N, T]
+   |
+   |  (if 3D) unsqueeze(-1) -> [B, C_in, N, 1]
+   v
+Pad to receptive_field (if T < RF)
+   v
+Start Conv: 1x1 Conv2d (in_dim -> residual_channels)
+   x: [B, R, N, T']
+   |
+   |  (optional) Adaptive Adjacency from embed
+   |    nv1 = MLP(embed) , nv2 = MLP(embed)
+   |    adp = softmax(relu(nv1 @ nv2^T))   -> [N,N]
+   |    adj = [A_fwd, A_bwd] + [adp]
+   v
+
+================= repeat K = blocks * layers times =================
+
+(1) residual = x
+
+(2)  Embedding injection #1  (SGA or naive)
+     x = addition(x, embed)
+     - SGA:  x = x + sigmoid(Conv( relu(Conv([x,e])) )) * e
+     - naive: x = x + e
+
+(3)  Gated Temporal Convolution (dilated TCN)
+     filter = tanh(Conv_dilated(x))
+     gate   = sigmoid(Conv_dilated(x))
+     x = filter * gate
+
+(4)  Skip connection branch
+     s = Conv1x1(x)   -> skip_channels
+     skip = skip + s  (align time dim)
+
+(5)  Embedding injection #2  (addition again)
+     x = addition(x, embed)
+
+(6)  Graph Convolution (diffusion GCN)
+     x = gcn(x, support=adj)
+     - nconv for A·X, A^2·X ... concat then 1x1 projection
+
+(7)  Residual add
+     x = x + residual[:, :, :, -x.size(3):]
+
+(8)  BatchNorm2d
+     x = BN(x)
+
+==============================================================
+
+   |
+   v
+Output head (skip only)
+skip -> ReLU -> 1x1 Conv(skip->end_channels) -> ReLU -> 1x1 Conv(end->out_dim)
+   v
+Take last time step:  x = x[..., -1]
+   v
+Output: [B, out_dim(=1), N]
+'''
+import random
+import sys
+import math
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import torch.nn.functional as F
+from torch.autograd import Variable
+import scipy.sparse as sp
+from scipy.sparse.linalg import eigs
+from networkx import bfs_tree
+import numpy as np
+import pandas as pd
+from Utils import load_pickle
+from graph import generate_quotient_graph, generate_graphs
+from torch_geometric.nn import GCNConv, GraphNorm
+
+class nconv(nn.Module):
+    def __init__(self):
+        super(nconv,self).__init__()
+
+    def forward(self,x, A):
+        x = torch.einsum('ncvl,vw->ncwl',(x,A))
+        return x.contiguous()
+
+class linear(nn.Module):
+    def __init__(self,c_in,c_out):
+        super(linear,self).__init__()
+        self.mlp = torch.nn.Conv2d(c_in, c_out, kernel_size=(1, 1), padding=(0,0), stride=(1,1), bias=True)
+
+    def forward(self,x):
+        return self.mlp(x)
+
+class gcn(nn.Module):
+    def __init__(self,c_in,c_out,dropout,support_len=3,order=2):
+        super(gcn,self).__init__()
+        self.nconv = nconv()
+        c_in = (order*support_len+1)*c_in
+        self.mlp = linear(c_in,c_out)
+        self.dropout = dropout
+        self.order = order
+
+    def forward(self,x,support):
+        out = [x]
+        for a in support:
+            x1 = self.nconv(x,a)
+            out.append(x1)
+            for k in range(2, self.order + 1):
+                x2 = self.nconv(x1,a)
+                out.append(x2)
+                x1 = x2
+
+        h = torch.cat(out,dim=1)
+        h = self.mlp(h)
+        h = F.dropout(h, self.dropout, training=self.training)
+        return h
+
+class gwnet(nn.Module):
+    def __init__(self,
+                 device,
+                 num_nodes,
+                 dropout=0.0,
+                 in_dim=2,
+                 out_dim=1,
+                 residual_channels=32,
+                 dilation_channels=32,
+                 skip_channels=256,
+                 end_channels=512,
+                 kernel_size=2,
+                 blocks=4,
+                 layers=2,
+                 sga=True,
+                 adp_adj=False):
+        super(gwnet, self).__init__()
+        self.dropout = dropout
+        self.blocks = blocks
+        self.layers = layers
+        self.adp_adj = adp_adj
+        self.device = device
+
+        self.filter_convs = nn.ModuleList()
+        self.gate_convs = nn.ModuleList()
+        self.residual_convs = nn.ModuleList()
+        self.skip_convs = nn.ModuleList()
+        self.bn = nn.ModuleList()
+        self.gconv = nn.ModuleList()
+
+        self.start_conv = nn.Conv2d(in_channels=in_dim, out_channels=residual_channels, kernel_size=(1, 1))
+        receptive_field = 1
+
+        if sga:
+            self.sga_gate1 = nn.Conv2d(in_channels=2 * residual_channels, out_channels=4 * residual_channels, kernel_size=(1, 1))
+            self.sga_gate2 = nn.Conv2d(in_channels=4 * residual_channels, out_channels=1, kernel_size=(1, 1))
+            self.addition = self.spatially_gated_addition
+        else:
+            self.addition = self.naive_addition
+
+        if adp_adj:
+            self.embed_proj11 = nn.Linear(residual_channels, 4 * residual_channels, bias=False)
+            self.embed_proj12 = nn.Linear(residual_channels * 4, residual_channels, bias=False)
+            self.embed_proj21 = nn.Linear(residual_channels, 4 * residual_channels, bias=False)
+            self.embed_proj22 = nn.Linear(residual_channels * 4, residual_channels, bias=False)
+
+        for b in range(blocks):
+            additional_scope = kernel_size - 1
+            new_dilation = 1
+            for i in range(layers):
+                self.filter_convs.append(nn.Conv2d(residual_channels, dilation_channels, (1, kernel_size), dilation=new_dilation))
+                self.gate_convs.append(nn.Conv2d(residual_channels, dilation_channels, (1, kernel_size), dilation=new_dilation))
+                self.residual_convs.append(nn.Conv2d(dilation_channels, residual_channels, kernel_size=(1, 1)))
+                self.skip_convs.append(nn.Conv2d(dilation_channels, skip_channels, kernel_size=(1, 1)))
+                self.bn.append(nn.BatchNorm2d(residual_channels))
+                self.gconv.append(gcn(dilation_channels, residual_channels, dropout, support_len=2 + int(adp_adj)))
+                new_dilation *= 2
+                receptive_field += additional_scope
+                additional_scope *= 2
+
+        self.end_conv_1 = nn.Conv2d(skip_channels, end_channels, kernel_size=(1, 1), bias=True)
+        self.end_conv_2 = nn.Conv2d(end_channels, out_dim, kernel_size=(1, 1), bias=True)
+        self.receptive_field = receptive_field
+
+    def spatially_gated_addition(self, x, e):
+        e = e.unsqueeze(0).unsqueeze(-1).expand(x.shape[0], -1, -1, x.shape[-1])
+        g = self.sga_gate1(torch.cat((x, e), dim=1))
+        g = F.relu(g)
+        g = self.sga_gate2(g)
+        g = torch.sigmoid(g)
+        x = x + g * e
+        return x
+
+    def naive_addition(self, x, e):
+        return x + e.unsqueeze(0).unsqueeze(-1).expand(x.shape[0], -1, -1, x.shape[-1])
+
+    def forward(self, input, adj, embed):
+        
+        # input shape: [B, 1, N] (no time) -> [B, 1, N, 1]
+        if input.dim() == 3:
+            input = input.unsqueeze(-1)
+
+        in_len = input.size(3)
+        if in_len < self.receptive_field:
+            x = F.pad(input, (self.receptive_field - in_len, 0, 0, 0))
+        else:
+            x = input
+        #print('x.shape before input to model:', x.shape)
+        x = self.start_conv(x)
+        skip = 0
+
+        if self.adp_adj:
+            nv1 = self.embed_proj12(F.relu(self.embed_proj11(embed.T)))
+            nv2 = self.embed_proj22(F.relu(self.embed_proj21(embed.T)))
+            adp = F.softmax(F.relu(torch.mm(nv1, nv2.T)), dim=1)
+            adj = adj + [adp]
+
+        for i in range(self.blocks * self.layers):
+            residual = x
+            x = self.addition(x, embed)
+            filter = torch.tanh(self.filter_convs[i](x))
+            gate = torch.sigmoid(self.gate_convs[i](x))
+            x = filter * gate
+            s = self.skip_convs[i](x)
+            try:
+                skip = skip[:, :, :, -s.size(3):]
+            except:
+                skip = 0
+            skip = s + skip
+            x = self.addition(x, embed)
+            x = self.gconv[i](x, adj)
+            x = x + residual[:, :, :, -x.size(3):]
+            x = self.bn[i](x)
+
+        x = F.relu(skip)
+        x = F.relu(self.end_conv_1(x))
+        x = self.end_conv_2(x)
+        x = x[..., -1]  # current-step prediction [B, 1, N]
+        return x
+def sym_adj(adj):
+    """Symmetrically normalize adjacency matrix."""
+    adj = sp.coo_matrix(adj)
+    rowsum = np.array(adj.sum(1))
+    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+    return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).astype(np.float32).todense()
+
+def asym_adj(adj):
+    adj = sp.coo_matrix(adj)
+    rowsum = np.array(adj.sum(1)).flatten()
+    d_inv = np.power(rowsum, -1).flatten()
+    d_inv[np.isinf(d_inv)] = 0.
+    d_mat= sp.diags(d_inv)
+    return np.array(d_mat.dot(adj).astype(np.float32).todense())
+
+def calculate_normalized_laplacian(adj):
+    """
+    # L = D^-1/2 (D-A) D^-1/2 = I - D^-1/2 A D^-1/2
+    # D = diag(A 1)
+    :param adj:
+    :return:
+    """
+    adj = sp.coo_matrix(adj)
+    d = np.array(adj.sum(1))
+    d_inv_sqrt = np.power(d, -0.5).flatten()
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+    normalized_laplacian = sp.eye(adj.shape[0]) - adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
+    return normalized_laplacian
+
+def calculate_scaled_laplacian(adj_mx, lambda_max=2, undirected=True):
+    if undirected:
+        adj_mx = np.maximum.reduce([adj_mx, adj_mx.T])
+    L = calculate_normalized_laplacian(adj_mx)
+    if lambda_max is None:
+        lambda_max, _ = linalg.eigsh(L, 1, which='LM')
+        lambda_max = lambda_max[0]
+    L = sp.csr_matrix(L)
+    M, _ = L.shape
+    I = sp.identity(M, format='csr', dtype=L.dtype)
+    L = (2 / lambda_max * L) - I
+    return L.astype(np.float32).todense()
+
+def load_adj(pkl_filename, adjtype, dataname):
+    if dataname in ('METRLA', 'PEMSBAY', 'EXPYTKY', 'PEMS07', 'PEMS11160'):
+        sensor_ids, sensor_id_to_ind, adj_mx = load_pickle(pkl_filename)
+    elif dataname == 'PEMSD7M':
+        adj_mx = pd.read_csv(pkl_filename).values
+        distances = adj_mx[~np.isinf(adj_mx)].flatten()
+        std = distances.std()
+        adj_mx = np.exp(-np.square(adj_mx / std))
+    if adjtype == "scalap":
+        adj = [calculate_scaled_laplacian(adj_mx)]
+    elif adjtype == "normlap":
+        adj = [calculate_normalized_laplacian(adj_mx).astype(np.float32).todense()]
+    elif adjtype == "symnadj":
+        adj = [sym_adj(adj_mx)]
+    elif adjtype == "transition":
+        adj = [asym_adj(adj_mx)]
+    elif adjtype == "doubletransition":
+        adj = [asym_adj(adj_mx), asym_adj(np.transpose(adj_mx))]
+    elif adjtype == "identity":
+        adj = [np.diag(np.ones(adj_mx.shape[0])).astype(np.float32)]
+    else:
+        error = 0
+        assert error, "adj type not defined"
+    return adj
+
+def nt_xent_loss(out_1, out_2, temperature):
+    """Loss used in SimCLR."""
+    # https://github.com/PyTorchLightning/lightning-bolts/blob/master/pl_bolts/losses/self_supervised_learning.py
+    out = torch.cat([out_1, out_2], dim=0)
+    n_samples = len(out)
+
+    # Full similarity matrix
+    cov = torch.mm(out, out.t().contiguous())
+    sim = torch.exp(cov / temperature)
+
+    # Negative similarity
+    mask = ~torch.eye(n_samples, device=sim.device).bool()
+    neg = sim.masked_select(mask).view(n_samples, -1).sum(dim=-1)
+
+    # Positive similarity :
+    pos = torch.exp(torch.sum(out_1 * out_2, dim=-1) / temperature)
+    pos = torch.cat([pos, pos], dim=0)
+    loss = -torch.log(pos / neg).mean()
+
+    return loss
+
+
+class Geometric_Encoder(nn.Module):
+    def __init__(self, temperature, num_features, graph_norm, hidden):
+        super().__init__()
+        self.temperature = temperature
+        self.graph_norm = graph_norm
+        self.hidden = hidden
+        # MLP, hidden layer dim 320
+        self.fc1 = torch.nn.Linear(num_features, hidden)
+        self.fc2 = torch.nn.Linear(hidden, 32)
+        self.fc3 = torch.nn.Linear(32, 32)
+        # NOTE: to extend this, use PyTorch ModuleList
+        # GCN for message passing
+        # 2-neighbour
+        self.gcn1 = GCNConv(32, 32)
+        self.gcn2 = GCNConv(32, 32)
+        # try adding a GraphNorm, not a batchnorm
+        self.graphnorm1 = GraphNorm(32)
+        self.graphnorm2 = GraphNorm(32)
+        # try adding a final "projection layer"?? see SimCLR
+        # InfoNCE loss space is different to representation space, so we avoid overfitting
+        self.fc_proj = torch.nn.Linear(32, 32)
+
+    def forward(self, x, graph):
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        x = F.relu(x)
+        x = self.gcn1(x, graph)
+        if self.graph_norm:
+            x = self.graphnorm1(x)
+        x = F.relu(x)
+        x = self.gcn2(x, graph)
+        if self.graph_norm:
+            x = self.graphnorm2(x)
+        x = F.relu(x)
+        x = self.fc3(x)
+        x = F.relu(x)
+        return x
+
+    # [BATCHSIZE, 4, ...]
+    def contrast(self, x1, x2, graph1, graph2):
+        x1 = self(x1, graph1)
+        x2 = self(x2, graph2)
+        # only do this here, because we're doing this for pretraining
+        x1 = self.fc_proj(x1)
+        x2 = self.fc_proj(x2)
+        # L2 norm
+        x1 = F.normalize(x1)
+        x2 = F.normalize(x2)
+        # calculate loss
+        return nt_xent_loss(x1, x2, self.temperature)
+
+class Contrastive_FeatureExtractor_conv(nn.Module):
+    def __init__(self, temperature=1):
+        super().__init__()
+        self.temperature = temperature
+        self.conv1 = torch.nn.Conv1d( 1, 32, 13, stride=1) # 1 hour --> per timestep
+        self.conv2 = torch.nn.Conv1d(32, 32, 12, stride=12) # 2 hour --> per hour
+        self.conv3 = torch.nn.Conv1d(32, 32, 24, stride=24) # 1 day --> per day
+        self.fc1 = torch.nn.Linear(32*3, 32)
+        self.fc2 = torch.nn.Linear(32, 32)
+        self.bn1 = torch.nn.BatchNorm1d(32)
+        self.bn2 = torch.nn.BatchNorm1d(32)
+        self.bn3 = torch.nn.BatchNorm1d(32*3)
+        self.bn4 = torch.nn.BatchNorm1d(32)
+    def forward(self, x):
+        x = self.conv1(x[:,None,:])
+        x = F.relu(x)
+        x = self.bn1(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = self.bn2(x)
+        x = self.conv3(x)
+        # sample half of samples
+        n_half = int(x.shape[-1]/2)
+        x_ = torch.empty(x.shape[0], x.shape[1], n_half).to(x.device)
+        for i in range(x.shape[0]):
+            idx = np.arange(x.shape[2])
+            np.random.shuffle(idx)
+            idx = idx < n_half
+            x_[i, :, :] = x[i, :, idx]
+        # aggregate
+        x_u = x_.mean(axis=2)
+        x_z = x_.std(axis=2)
+        x_x, _ = torch.max(x_, axis=2)
+        x = torch.cat((x_u, x_z, x_x), axis=1)
+        # project
+        x = self.bn3(x)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.bn4(x)
+        return x
+    
+    def contrast(self, x):
+        # project
+        x1 = self(x)
+        x2 = self(x)
+        x1 = self.fc2(x1)
+        x2 = self.fc2(x2)
+        # L2 norm
+        x1 = F.normalize(x1)
+        x2 = F.normalize(x2)
+        # calculate loss
+        return nt_xent_loss(x1,x2,self.temperature)
+
+def main(GPU=None):
+    from Param import CHANNEL,N_NODE,TIMESTEP_IN
+    from Param_GraphWaveNet import ADJPATH,ADJTYPE
+    if GPU == None:
+        GPU = sys.argv[-1] if len(sys.argv) == 2 else '3'
+    device = torch.device("cuda:{}".format(GPU)) if torch.cuda.is_available() else torch.device("cpu") 
+    model = gwnet(device, num_nodes=N_NODE, in_dim=CHANNEL, supports=None).to(device)
+    return model
+    
+if __name__ == '__main__':
+    main()

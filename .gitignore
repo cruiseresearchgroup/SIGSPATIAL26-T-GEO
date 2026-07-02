@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.so
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# training outputs (keep bundled save/METRLA and save/PEMSBAY)
+save/est_*/
+
+# optional: exclude duplicate legacy pretrain name
+# save/*/pretrain_temporal.pt
