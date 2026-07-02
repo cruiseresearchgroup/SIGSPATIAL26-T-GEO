@@ -4,11 +4,18 @@ Minimal release bundle for **T-GEO** (GraphWaveNet + geo/topo pretraining + Topo
 
 Code and checkpoints are taken from `9993/6-10`.
 
+## Framework
+
+<p align="center">
+  <img src="framework.png" alt="T-GEO framework" width="900"/>
+</p>
+
 ## Directory layout
 
 ```
 TGEO_bundle/
 ├── README.md
+├── framework.png           # model overview figure
 ├── METRLA/                 # dataset (symlinks to topo+Harmonic+GWN)
 │   ├── metr-la.h5
 │   ├── adj_mx.pkl
